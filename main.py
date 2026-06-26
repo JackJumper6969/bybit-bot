@@ -1,5 +1,6 @@
 from flask import Flask, request
 import os
+import time
 from pybit.unified_trading import HTTP
 
 app = Flask(__name__)
@@ -7,22 +8,29 @@ app = Flask(__name__)
 # === НАСТРОЙКИ ===
 API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
-TESTNET = False  # True для теста
+TESTNET = False
 
-session = HTTP(api_key=API_KEY, api_secret=API_SECRET, testnet=TESTNET)
+session = HTTP(
+    api_key=API_KEY, 
+    api_secret=API_SECRET, 
+    testnet=TESTNET,
+    recv_window=10000  # увеличиваем таймаут
+)
 
-TRADE_MARGIN_PERCENT = 0.05   # 5% от баланса на одну сделку
-MAX_MARGIN_USAGE = 0.50       # максимум 50% депозита в открытых позициях
+TRADE_MARGIN_PERCENT = 0.05
+MAX_MARGIN_USAGE = 0.50
+LEVERAGE = 10
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
+    start_time = time.time()
     try:
-        data = request.get_json() or request.data.decode('utf-8')
+        data = request.get_json(silent=True) or request.data.decode('utf-8', errors='ignore')
         message = str(data).upper()
 
-        print("Сигнал:", message)
+        print("=== СИГНАЛ ===")
+        print(message[:300])  # чтобы не спамить
 
-        # Определяем направление
         if "ENTER-LONG" in message:
             side = "Buy"
         elif "ENTER-SHORT" in message:
@@ -30,51 +38,60 @@ def webhook():
         else:
             return "Ignored", 200
 
-        # Извлекаем тикер
+        # Тикер
         ticker = None
         for word in message.split():
-            if "USDT" in word:
-                ticker = word.replace(".P", "").strip()
+            if "USDT" in word.upper():
+                ticker = word.replace(".P", "").strip().upper()
                 break
-
         if not ticker:
             ticker = "BTCUSDT"
-
         symbol = ticker + ".P"
 
-        # === РАСЧЁТ РАЗМЕРА ПОЗИЦИИ ===
-        # Получаем баланс
-        balance = session.get_wallet_balance(accountType="UNIFIED")['result']['list'][0]['totalEquity']
-        balance = float(balance)
+        print(f"→ {side} {symbol}")
 
-        margin_for_trade = balance * TRADE_MARGIN_PERCENT
+        # Быстрый баланс + позиция
+        try:
+            balance_resp = session.get_wallet_balance(accountType="UNIFIED")
+            balance = float(balance_resp['result']['list'][0]['totalEquity'])
+            margin_for_trade = max(10, balance * TRADE_MARGIN_PERCENT)  # минимум 10$
 
-        # Проверка лимита 50%
-        positions = session.get_positions(category="linear")['result']['list']
-        used_margin = sum(float(p['positionIM']) for p in positions if float(p['positionIM']) > 0)
+            # Проверка лимита
+            pos_resp = session.get_positions(category="linear")
+            positions = pos_resp.get('result', {}).get('list', [])
+            used = sum(float(p.get('positionIM', 0)) for p in positions)
+            
+            if used + margin_for_trade > balance * MAX_MARGIN_USAGE:
+                print("Лимит 50% превышен")
+                return "Limit reached", 200
+        except:
+            margin_for_trade = 15  # fallback
 
-        if used_margin + margin_for_trade > balance * MAX_MARGIN_USAGE:
-            print("Превышен лимит 50% маржи. Сделка отклонена.")
-            return "Margin limit reached", 200
+        # Плечо
+        try:
+            session.set_leverage(category="linear", symbol=symbol, buyLeverage=LEVERAGE, sellLeverage=LEVERAGE)
+        except:
+            pass
 
-        # Открываем ордер
+        # Ордер
         order = session.place_order(
             category="linear",
             symbol=symbol,
             side=side,
             orderType="Market",
-            qty=margin_for_trade,           # в USDT
-            qtyType="margin",               # важно!
-            leverage=10
+            qty=margin_for_trade,
+            qtyType="margin",
+            positionIdx=0
         )
 
-        print(f"✅ {side} по {symbol} | Маржа: {margin_for_trade:.2f}$")
+        print(f"✅ УСПЕХ {side} {symbol} | {margin_for_trade:.1f}$")
         return "Success", 200
 
     except Exception as e:
-        print("Ошибка:", e)
+        print("❌ Ошибка:", str(e)[:200])
         return "Error", 500
-
+    finally:
+        print(f"Время выполнения: {time.time() - start_time:.2f} сек")
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
