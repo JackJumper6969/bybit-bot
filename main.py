@@ -13,21 +13,26 @@ session = HTTP(
     api_key=API_KEY, 
     api_secret=API_SECRET, 
     testnet=TESTNET,
-    recv_window=15000
+    recv_window=20000
 )
 
 TRADE_MARGIN_PERCENT = 0.05
 MAX_MARGIN_USAGE = 0.50
 LEVERAGE = 10
 
+# Защита от спама
+last_trade_time = 0
+MIN_TIME_BETWEEN_TRADES = 5  # минимум 5 секунд между сделками
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
+    global last_trade_time
     start = time.time()
     try:
         data = request.get_json(silent=True) or request.data.decode('utf-8', errors='ignore')
         message = str(data).upper()
 
-        print("=== НОВЫЙ СИГНАЛ ===")
+        print("=== СИГНАЛ ===")
         print(message)
 
         if "ENTER-LONG" in message:
@@ -46,9 +51,17 @@ def webhook():
         if not ticker:
             ticker = "BTCUSDT"
         symbol = ticker + ".P"
+
         print(f"→ {side} {symbol}")
 
-        # Баланс + размер
+        # Анти-спам
+        now = time.time()
+        if now - last_trade_time < MIN_TIME_BETWEEN_TRADES:
+            print("⏳ Слишком часто — пропускаем")
+            return "Too frequent", 200
+        last_trade_time = now
+
+        # Баланс
         try:
             bal = session.get_wallet_balance(accountType="UNIFIED")
             balance = float(bal['result']['list'][0]['totalEquity'])
@@ -71,8 +84,8 @@ def webhook():
         # Плечо
         try:
             session.set_leverage(category="linear", symbol=symbol, buyLeverage=LEVERAGE, sellLeverage=LEVERAGE)
-        except Exception as e:
-            print("Leverage warning:", e)
+        except:
+            pass
 
         # Ордер
         order = session.place_order(
@@ -89,14 +102,17 @@ def webhook():
 
     except Exception as e:
         error_msg = str(e)
-        print("❌ КРИТИЧНАЯ ОШИБКА:", error_msg)
-        if "Insufficient" in error_msg or "margin" in error_msg.lower():
-            print("Проблема с маржей/балансом")
-        elif "symbol" in error_msg.lower():
-            print("Проблема с символом")
+        print("❌ ОШИБКА:", error_msg)
+        
+        if "rate limit" in error_msg.lower() or "403" in error_msg:
+            print("Rate limit от Bybit — ждём...")
+            time.sleep(3)
+        elif "ip" in error_msg.lower() or "usa" in error_msg.lower():
+            print("Проблема с IP (USA) — Bybit блокирует")
+        
         return "Error", 500
     finally:
-        print(f"Время: {time.time()-start:.2f} сек\n")
+        print(f"Время выполнения: {time.time()-start:.2f} сек\n")
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
